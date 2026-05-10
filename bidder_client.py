@@ -4,7 +4,7 @@ import json
 import sys
 import os
 
-from lamport import LamportClock
+from lamport_clock import LamportClock
 
 NAMING_HOST = "127.0.0.1"
 NAMING_PORT = 4000
@@ -28,7 +28,7 @@ def recv_json(sock):
     """Receive a newline-terminated JSON message from socket"""
     buffer = ""
     while "\n" not in buffer:
-        chunk = sock.resv(BUFFER_SIZE).decode()
+        chunk = sock.recv(BUFFER_SIZE).decode()
         if not chunk:
             return None
         buffer += chunk
@@ -57,7 +57,7 @@ class PlayerClient:
         self.current_question_number = None
         self.question_lock = threading.Lock()
 
-        self.buzzer_this_round = False
+        self.buzzed_this_round = False
 
         print(f"[Client] Starting as player: {username}")
               
@@ -98,14 +98,14 @@ class PlayerClient:
         import struct
         group = socket.inet_aton(MULTICAST_GROUP)
         mreq = struct.pack("4sL", group, socket.INADDR_ANY)
-        sock.setsockpt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
 
-        print(f"[Client] Listening for questions on multicast {MULTICAST_GROUP:MULTICAST_PORT}")
+        print(f"[Client] Listening for questions on multicast {MULTICAST_GROUP}:{MULTICAST_PORT}")
 
         while True: 
             try:
                 data, _ = sock.recvfrom(BUFFER_SIZE)
-                msg = json.load(data.decode())
+                msg = json.loads(data.decode())
                 msg_type = msg.get("type")
 
                 if msg_type == "QUESTION":
@@ -132,13 +132,13 @@ class PlayerClient:
                     ts = payload.get("lamport_time", "?")
 
                     if winner == self.username:
-                        print(f"\n[Client] YOU WON! {lamport: {ts}}")
+                        print(f"\n[Client] YOU WON! (Lamport: {ts})")
                     else:
                         print(f"\n[Client]'{winner}' buzzed in first (Lamport:{ts}). Better luck next time!")
 
                 elif msg_type == "START":
                     print(f"\n[Client] Game over! Thanks for playing.")
-                    os.exit(0)
+                    sys.exit(0)
             except Exception as e:
                 print(f"[Client] Multicast error: {e}")
     
@@ -156,10 +156,10 @@ class PlayerClient:
         self.clock.increment()
         timestamp = self.clock.get_time()
 
-        print(f"[Client] buzz! (Lamport: {timestamp}")
+        print(f"[Client] Buzz! (Lamport: {timestamp})")
 
         try: 
-            sock = socket.socket(socket.AF.INET, socket.SOCK_STREAM)
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.connect((SERVER_HOST, SERVER_PORT))
 
             send_json(sock, {
@@ -174,7 +174,7 @@ class PlayerClient:
             sock.settimeout(10.0)
             response = recv_json(sock)
 
-            if response in None:
+            if response is None:
                 print("[Client] No response from server.")
                 sock.close()
                 return
@@ -209,10 +209,10 @@ class PlayerClient:
 
             elif resp_type == "ACK": 
                 info = payload.get("info", "")
-                print(f"[Client] Server: (info)")
+                print(f"[Client] Server: {info}")
         
         except socket.timeout: 
-            pirnt("[Client] Server did not respont in time.")
+            print("[Client] Server did not respond in time.")
         except Exception as e:
             print(f"[Client] Error during buzz: {e}")
         finally: 
