@@ -1,26 +1,82 @@
 import sys
 import os
 import threading
+import time
+import socket
+import json
 from lamport_clock import LamportClock
 from utils import connect_to_server, request_response, start_receiver_thread
 
-NAMING_HOST = "127.0.0.1"
-NAMING_PORT = 4000
+def find_naming_server():
+    """Hunts for the Naming Server using a staggered approach to avoid ARP flooding."""
+    print("[NETWORK] Searching for Naming Server on LAN...")
+    udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 
-def wait_for_keypress():
-    '''Block until the player presses any key (Cross-Platform).'''
+    # WINDOWS ICMP FIX
     if os.name == 'nt':
-        import msvcrt
-        msvcrt.getch()
-    else:
-        import tty, termios
-        fd = sys.stdin.fileno()
-        old_settings = termios.tcgetattr(fd)
+        SIO_UDP_CONNRESET = 0x9800000C
         try:
-            tty.setraw(fd)
-            sys.stdin.read(1)
-        finally: 
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            udp_sock.ioctl(SIO_UDP_CONNRESET, False)
+        except Exception:
+            pass 
+
+    # 1. Figure out the client's own IP to guess the local subnet
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(('10.255.255.255', 1))
+        my_ip = s.getsockname()[0]
+        s.close()
+        subnet_prefix = ".".join(my_ip.split(".")[:-1]) + "."
+    except Exception:
+        subnet_prefix = "192.168.100." 
+
+    while True:
+        # ==========================================
+        # PHASE 1: The VIP List (Fast & Lightweight)
+        # ==========================================
+        try:
+            # 1. Localhost (Fixes the Pi client instantly)
+            udp_sock.sendto(b"WHERE_IS_NAMING_SERVER", ("127.0.0.1", 4001))
+            # 2. Direct Hint (Fixes the Phone client)
+            udp_sock.sendto(b"WHERE_IS_NAMING_SERVER", ("192.168.100.46", 4001))
+            # 3. Universal Broadcast
+            udp_sock.sendto(b"WHERE_IS_NAMING_SERVER", ("<broadcast>", 4001))
+        except OSError:
+            pass # Ignore random OS network errors
+
+        # LISTEN IMMEDIATELY before bogging down the network
+        udp_sock.settimeout(0.5)
+        try:
+            data, addr = udp_sock.recvfrom(1024)
+            info = json.loads(data.decode())
+            host, port = info["host"], info["port"]
+            print(f"[NETWORK] Found Naming Server at {host}:{port}")
+            return host, port
+        except (socket.timeout, ConnectionResetError):
+            pass # No quick reply, move to Phase 2
+
+        # ==========================================
+        # PHASE 2: Heavy Subnet Scan (PC Fallback)
+        # ==========================================
+        for i in range(1, 255):
+            target_ip = f"{subnet_prefix}{i}"
+            try:
+                udp_sock.sendto(b"WHERE_IS_NAMING_SERVER", (target_ip, 4001))
+            except OSError:
+                # Catch Linux 'Network is unreachable' or ARP blocks silently
+                pass 
+
+        # LISTEN AGAIN
+        udp_sock.settimeout(1.0)
+        try:
+            data, addr = udp_sock.recvfrom(1024)
+            info = json.loads(data.decode())
+            host, port = info["host"], info["port"]
+            print(f"[NETWORK] Found Naming Server at {host}:{port}")
+            return host, port
+        except (socket.timeout, ConnectionResetError):
+            print("[NETWORK] Still searching...")
 
 class PlayerClient:
     def __init__(self, username: str):
@@ -34,42 +90,49 @@ class PlayerClient:
         self.question_lock = threading.Lock()
         self.buzzed_this_round = False
         
-        # State flag to stop keyboard input collision when typing an answer
-        self.question_lock = threading.Lock()
-        self.buzzed_this_round = False
-        
-        # NEW: Thread synchronization for the buzzer
         self.buzz_response_event = threading.Event()
         self.won_buzz = False
+        self.is_answering = False
 
         print(f"[Client] Starting as player: {username}")
 
-        print(f"[Client] Starting as player: {username}")
+    def connect_to_host(self):
+        print("[Client] Looking for the Trivia Server...")
+        while True:
+            try:
+                naming_host, naming_port = find_naming_server()
+                print(f"[DEBUG] Attempting TCP connection to: {naming_host}:{naming_port}")
 
-    def register(self):
-        try:
-            response = request_response(
-                NAMING_HOST, NAMING_PORT,
-                {"type": "register", "service": self.username, "host": "127.0.0.1", "port": 9999}
-            )
-            if response.get("status") == "ok":
-                print(f"[Client] Registered as {self.username}")
-            else:
-                print(f"[Client] Registration failed: {response}")
-        except Exception as e:
-            print(f"[Client] Naming server error: {e}")
+                # 2. Register ourselves
+                request_response(
+                    naming_host, naming_port,
+                    {"type": "register", "service": self.username, "host": "192.168.100.46", "port": 9999}
+                )
 
-    def resolve_server(self):
-        response = request_response(
-            NAMING_HOST, NAMING_PORT,
-            {"type": "resolve", "service": "trivia.server.main"}
-        )
-        if response.get("status") != "ok":
-            raise Exception("Could not resolve server")
-        return response["host"], response["port"]
+                # 3. Ask Naming Server for the Trivia Server
+                response = request_response(
+                    naming_host, naming_port,
+                    {"type": "resolve", "service": "trivia.server.main"}
+                )
+
+                if response.get("status") != "ok":
+                    raise Exception("Trivia server not registered yet.")
+
+                host, port = response["host"], response["port"]
+
+                # 4. Attempt to connect to the Trivia Server
+                self.conn = connect_to_server(host, port)
+                
+                # 5. Tell the server we joined
+                self.conn.send({"type": "JOIN", "payload": {"player_id": self.username}})
+                print("[Client] Successfully connected to the host!")
+                break 
+
+            except Exception as e:
+                print(f"[Client] Host not ready ({e}). Retrying in 3 seconds...")
+                time.sleep(3)
 
     def handle_server_message(self, conn, msg):
-        """Callback for start_receiver_thread when the server sends a broadcast"""
         msg_type = msg.get("type")
 
         if msg_type == "START":
@@ -90,12 +153,11 @@ class PlayerClient:
             
             print(f"\n{'='*50}")
             print(f"[Q{q_num}] {self.current_question}")
-            print(f"Press ANY KEY to buzz in!")
+            print(f"Press ENTER to buzz in!")
             print(f"{'='*50}")
 
         elif msg_type == "WINNER": 
             payload = msg.get("payload", {})
-            # Check if this is a direct response to OUR buzz, or a broadcast to everyone
             is_direct_response = "you_won" in payload
             you_won = payload.get("you_won", False)
             ts = payload.get("lamport_time", "?")
@@ -108,16 +170,16 @@ class PlayerClient:
                 print(f"\n[Client] YOU WON the buzz! (Lamport: {ts})")
                 print(f"Question: {self.current_question}")
                 self.won_buzz = True
-                self.buzz_response_event.set() # Wake up the main thread
+                self.buzz_response_event.set()
                 
             elif is_direct_response:
                 print(f"\n[Client] You were too late. '{winner}' buzzed in first.")
                 self.won_buzz = False
-                self.buzz_response_event.set() # Wake up the main thread
+                self.buzz_response_event.set()
                 
             else:
                 print(f"\n[Client] '{winner}' buzzed in first (Lamport: {ts}). Better luck next time!")
-                self.buzzed_this_round = True # Lock us out from buzzing
+                self.buzzed_this_round = True
                 
         elif msg_type == "RESULT":
             print(f"\n[Client] {msg['payload']['message']}")
@@ -131,24 +193,17 @@ class PlayerClient:
         os._exit(1)
 
     def run(self):
-        # 1. Register and connect
-        self.register()
-        host, port = self.resolve_server()
-        
-        self.conn = connect_to_server(host, port)
-        
-        # Announce presence to server
-        self.conn.send({"type": "JOIN", "payload": {"player_id": self.username}})
-
-        # 2. Start listening to server broadcasts in the background
+        self.connect_to_host()
         start_receiver_thread(self.conn, self.handle_server_message, self.handle_disconnect)
 
         print("[Client] Waiting for game to start...\n")
 
-        # 3. Main thread handles keyboard buzzing exclusively
         while True: 
             try: 
-                wait_for_keypress()
+                input()
+                
+                if self.is_answering:
+                    continue
 
                 with self.question_lock:
                     if self.buzzed_this_round or self.current_question is None:
@@ -158,7 +213,6 @@ class PlayerClient:
                 timestamp = self.clock.increment()
                 print(f"[Client] Buzz! (Lamport: {timestamp})")
 
-                # Clear the event and send the buzz
                 self.buzz_response_event.clear()
                 self.conn.send({
                     "type": "BUZZ",
@@ -169,10 +223,8 @@ class PlayerClient:
                     }
                 })
 
-                # Pause the main thread until the server replies to our buzz
                 self.buzz_response_event.wait(timeout=5.0)
 
-                # If the background thread told us we won, ask for the answer safely!
                 if self.won_buzz:
                     answer = input("Your answer: ").strip()
                     self.conn.send({
@@ -191,9 +243,13 @@ class PlayerClient:
                 break
 
 if __name__ == "__main__": 
-    if len(sys.argv) < 2: 
-        print("Usage: python trivia_client.py <your_username>")
-        sys.exit(1)
+    if len(sys.argv) > 1:
+        username = sys.argv[1]
+    else:
+        print("=== Distributed Trivia ===")
+        username = ""
+        while not username:
+            username = input("Enter your username to join: ").strip()
     
-    client = PlayerClient(sys.argv[1])
+    client = PlayerClient(username)
     client.run()
