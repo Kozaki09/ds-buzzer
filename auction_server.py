@@ -1,7 +1,15 @@
-import socket, threading, json, time
+import socket
+import threading
+import json
+import time
+
+from lamport_clock import LamportClock
+
 
 HOST = "0.0.0.0"
 PORT = 5000
+
+AUCTION_DURATION = 60
 
 clients = []
 clients_lock = threading.Lock()
@@ -11,28 +19,8 @@ highest_bidder = None
 
 auction_active = True
 
-lamport_clock = 0
-clock_lock = threading.Lock()
-
-
-# =========================
-# Lamport Clock Functions
-# =========================
-
-def increment_clock():
-    global lamport_clock
-
-    with clock_lock:
-        lamport_clock += 1
-        return lamport_clock
-
-
-def update_clock(received_timestamp):
-    global lamport_clock
-
-    with clock_lock:
-        lamport_clock = max(lamport_clock, received_timestamp) + 1
-        return lamport_clock
+# Lamport Clock Instance
+clock = LamportClock()
 
 
 # =========================
@@ -45,9 +33,11 @@ def send_json(sock, data):
 
 
 def recv_json(sock):
+
     buffer = ""
 
     while "\n" not in buffer:
+
         data = sock.recv(1024).decode()
 
         if not data:
@@ -56,18 +46,22 @@ def recv_json(sock):
         buffer += data
 
     line, _ = buffer.split("\n", 1)
+
     return json.loads(line)
 
 
 # =========================
-# Broadcast
+# Broadcast Function
 # =========================
 
 def broadcast(message_data):
+
     dead_clients = []
 
     with clients_lock:
+
         for client in clients:
+
             try:
                 send_json(client, message_data)
 
@@ -83,12 +77,14 @@ def broadcast(message_data):
 # =========================
 
 def handle_client(client_socket, address):
+
     global highest_bid
     global highest_bidder
 
     print(f"[CONNECTED] {address}")
 
     try:
+
         while auction_active:
 
             data = recv_json(client_socket)
@@ -96,43 +92,89 @@ def handle_client(client_socket, address):
             if data is None:
                 break
 
-            if data["type"] == "join":
-                print(f"{data['username']} joined")
+            message_type = data.get("type")
 
-            elif data["type"] == "bid":
+            # =========================
+            # JOIN EVENT
+            # =========================
 
-                sender_time = data["timestamp"]
+            if message_type == "join":
 
-                current_clock = update_clock(sender_time)
+                username = data.get("username")
 
-                username = data["username"]
-                amount = data["amount"]
+                clock.increment()
 
                 print(
-                    f"[BID] {username} bid ${amount} "
-                    f"(client ts={sender_time}, server ts={current_clock})"
+                    f"[JOIN] {username} joined "
+                    f"(server clock={clock.get_time()})"
                 )
 
-                # Auction logic
+            # =========================
+            # BID EVENT
+            # =========================
+
+            elif message_type == "bid":
+
+                username = data.get("username")
+                amount = data.get("amount")
+                received_timestamp = data.get("timestamp")
+
+                # Lamport receive rule
+                updated_time = clock.update(received_timestamp)
+
+                print(
+                    f"[BID RECEIVED] "
+                    f"{username} bid ${amount} "
+                    f"(client ts={received_timestamp}, "
+                    f"server ts={updated_time})"
+                )
+
+                # Auction Logic
                 if amount > highest_bid:
 
                     highest_bid = amount
                     highest_bidder = username
 
-                    increment_clock()
+                    # Local event after processing
+                    current_time = clock.increment()
 
-                    broadcast({
+                    broadcast_message = {
                         "type": "broadcast",
-                        "message": f"{username} is now highest bidder",
+                        "message": (
+                            f"{username} is now highest bidder "
+                            f"with ${amount}"
+                        ),
                         "highest_bid": highest_bid,
                         "highest_bidder": highest_bidder,
-                        "timestamp": lamport_clock
-                    })
+                        "timestamp": current_time
+                    }
+
+                    print(
+                        f"[BROADCAST] "
+                        f"Highest bid updated to ${highest_bid}"
+                    )
+
+                    broadcast(broadcast_message)
+
+                else:
+
+                    rejection_message = {
+                        "type": "rejected",
+                        "message": (
+                            f"Bid rejected. "
+                            f"Current highest bid is ${highest_bid}"
+                        ),
+                        "timestamp": clock.increment()
+                    }
+
+                    send_json(client_socket, rejection_message)
 
     except Exception as e:
-        print(f"[ERROR] {e}")
+
+        print(f"[ERROR] {address}: {e}")
 
     finally:
+
         print(f"[DISCONNECTED] {address}")
 
         with clients_lock:
@@ -150,19 +192,32 @@ def auction_timer():
 
     global auction_active
 
-    time.sleep(60)
+    print(f"[AUCTION STARTED] Duration: {AUCTION_DURATION} seconds")
+
+    time.sleep(AUCTION_DURATION)
 
     auction_active = False
 
-    print("\n=== AUCTION ENDED ===")
+    final_timestamp = clock.increment()
 
-    result = {
+    result_message = {
         "type": "result",
         "winner": highest_bidder,
-        "amount": highest_bid
+        "amount": highest_bid,
+        "timestamp": final_timestamp
     }
 
-    broadcast(result)
+    print("\n=== AUCTION ENDED ===")
+
+    if highest_bidder:
+        print(
+            f"Winner: {highest_bidder} "
+            f"with ${highest_bid}"
+        )
+    else:
+        print("No bids received.")
+
+    broadcast(result_message)
 
 
 # =========================
@@ -176,28 +231,36 @@ def main():
     server.bind((HOST, PORT))
     server.listen()
 
-    print(f"[SERVER STARTED] {HOST}:{PORT}")
+    print(f"[SERVER STARTED] Listening on {HOST}:{PORT}")
 
-    # Start auction timer
-    threading.Thread(target=auction_timer, daemon=True).start()
+    # Start Auction Countdown
+    timer_thread = threading.Thread(
+        target=auction_timer,
+        daemon=True
+    )
+
+    timer_thread.start()
 
     while auction_active:
 
         try:
+
             client_socket, address = server.accept()
 
             with clients_lock:
                 clients.append(client_socket)
 
-            thread = threading.Thread(
+            client_thread = threading.Thread(
                 target=handle_client,
                 args=(client_socket, address),
                 daemon=True
             )
 
-            thread.start()
+            client_thread.start()
 
         except KeyboardInterrupt:
+
+            print("\n[SERVER SHUTDOWN]")
             break
 
     server.close()
