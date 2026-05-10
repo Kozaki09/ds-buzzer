@@ -7,13 +7,15 @@ import json
 from lamport_clock import LamportClock
 from utils import connect_to_server, request_response, start_receiver_thread
 
+# IMPORT PROTOCOL FACTORIES
+from messages import MsgType, make_register_msg, make_resolve_msg, make_join, make_buzz, make_answer
+
 def find_naming_server():
     """Hunts for the Naming Server using a staggered approach to avoid ARP flooding."""
     print("[NETWORK] Searching for Naming Server on LAN...")
     udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 
-    # WINDOWS ICMP FIX
     if os.name == 'nt':
         SIO_UDP_CONNRESET = 0x9800000C
         try:
@@ -21,7 +23,6 @@ def find_naming_server():
         except Exception:
             pass 
 
-    # 1. Figure out the client's own IP to guess the local subnet
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(('10.255.255.255', 1))
@@ -32,20 +33,13 @@ def find_naming_server():
         subnet_prefix = "192.168.100." 
 
     while True:
-        # ==========================================
-        # PHASE 1: The VIP List (Fast & Lightweight)
-        # ==========================================
         try:
-            # 1. Localhost (Fixes the Pi client instantly)
             udp_sock.sendto(b"WHERE_IS_NAMING_SERVER", ("127.0.0.1", 4001))
-            # 2. Direct Hint (Fixes the Phone client)
             udp_sock.sendto(b"WHERE_IS_NAMING_SERVER", ("192.168.100.46", 4001))
-            # 3. Universal Broadcast
             udp_sock.sendto(b"WHERE_IS_NAMING_SERVER", ("<broadcast>", 4001))
         except OSError:
-            pass # Ignore random OS network errors
+            pass 
 
-        # LISTEN IMMEDIATELY before bogging down the network
         udp_sock.settimeout(0.5)
         try:
             data, addr = udp_sock.recvfrom(1024)
@@ -54,20 +48,15 @@ def find_naming_server():
             print(f"[NETWORK] Found Naming Server at {host}:{port}")
             return host, port
         except (socket.timeout, ConnectionResetError):
-            pass # No quick reply, move to Phase 2
+            pass 
 
-        # ==========================================
-        # PHASE 2: Heavy Subnet Scan (PC Fallback)
-        # ==========================================
         for i in range(1, 255):
             target_ip = f"{subnet_prefix}{i}"
             try:
                 udp_sock.sendto(b"WHERE_IS_NAMING_SERVER", (target_ip, 4001))
             except OSError:
-                # Catch Linux 'Network is unreachable' or ARP blocks silently
                 pass 
 
-        # LISTEN AGAIN
         udp_sock.settimeout(1.0)
         try:
             data, addr = udp_sock.recvfrom(1024)
@@ -101,30 +90,25 @@ class PlayerClient:
         while True:
             try:
                 naming_host, naming_port = find_naming_server()
-                print(f"[DEBUG] Attempting TCP connection to: {naming_host}:{naming_port}")
-
-                # 2. Register ourselves
+                
                 request_response(
                     naming_host, naming_port,
-                    {"type": "register", "service": self.username, "host": "192.168.100.46", "port": 9999}
+                    make_register_msg(self.username, "127.0.0.1", 9999)
                 )
 
-                # 3. Ask Naming Server for the Trivia Server
                 response = request_response(
                     naming_host, naming_port,
-                    {"type": "resolve", "service": "trivia.server.main"}
+                    make_resolve_msg("trivia.server.main")
                 )
 
                 if response.get("status") != "ok":
                     raise Exception("Trivia server not registered yet.")
 
                 host, port = response["host"], response["port"]
-
-                # 4. Attempt to connect to the Trivia Server
                 self.conn = connect_to_server(host, port)
                 
-                # 5. Tell the server we joined
-                self.conn.send({"type": "JOIN", "payload": {"player_id": self.username}})
+                self.conn.send(make_join(self.username))
+                
                 print("[Client] Successfully connected to the host!")
                 break 
 
@@ -135,10 +119,10 @@ class PlayerClient:
     def handle_server_message(self, conn, msg):
         msg_type = msg.get("type")
 
-        if msg_type == "START":
+        if msg_type == MsgType.START:
             print(f"\n[Client] {msg['payload']['message']}")
 
-        elif msg_type == "QUESTION":
+        elif msg_type == MsgType.QUESTION:
             payload = msg.get("payload", {})
             q_num = msg.get("question_number")
             received_ts = payload.get("timestamp", 0)
@@ -156,9 +140,8 @@ class PlayerClient:
             print(f"Press ENTER to buzz in!")
             print(f"{'='*50}")
 
-        elif msg_type == "WINNER": 
+        elif msg_type == MsgType.WINNER: 
             payload = msg.get("payload", {})
-            is_direct_response = "you_won" in payload
             you_won = payload.get("you_won", False)
             ts = payload.get("lamport_time", "?")
             winner = payload.get("winner", "someone else")
@@ -172,19 +155,19 @@ class PlayerClient:
                 self.won_buzz = True
                 self.buzz_response_event.set()
                 
-            elif is_direct_response:
-                print(f"\n[Client] You were too late. '{winner}' buzzed in first.")
-                self.won_buzz = False
-                self.buzz_response_event.set()
-                
             else:
-                print(f"\n[Client] '{winner}' buzzed in first (Lamport: {ts}). Better luck next time!")
-                self.buzzed_this_round = True
+                if self.buzzed_this_round and not self.buzz_response_event.is_set():
+                    print(f"\n[Client] You were too late. '{winner}' buzzed in first.")
+                    self.won_buzz = False
+                    self.buzz_response_event.set()
+                else:
+                    print(f"\n[Client] '{winner}' buzzed in first (Lamport: {ts}). Better luck next time!")
+                    self.buzzed_this_round = True
                 
-        elif msg_type == "RESULT":
+        elif msg_type == MsgType.RESULT:
             print(f"\n[Client] {msg['payload']['message']}")
 
-        elif msg_type == "END":
+        elif msg_type == MsgType.END:
             print(f"\n[Client] Game over! Thanks for playing.")
             os._exit(0)
 
@@ -200,7 +183,7 @@ class PlayerClient:
 
         while True: 
             try: 
-                input()
+                input() 
                 
                 if self.is_answering:
                     continue
@@ -212,29 +195,14 @@ class PlayerClient:
                 
                 timestamp = self.clock.increment()
                 print(f"[Client] Buzz! (Lamport: {timestamp})")
-
                 self.buzz_response_event.clear()
-                self.conn.send({
-                    "type": "BUZZ",
-                    "payload": {
-                        "player_id": self.username,
-                        "lamport_time": timestamp,
-                        "question_number": self.current_question_number
-                    }
-                })
 
+                self.conn.send(make_buzz(self.username, timestamp, self.current_question_number))
                 self.buzz_response_event.wait(timeout=5.0)
 
                 if self.won_buzz:
                     answer = input("Your answer: ").strip()
-                    self.conn.send({
-                        "type": "ANSWER", 
-                        "payload": {
-                            "player_id": self.username,
-                            "answer": answer,
-                            "lamport_time": self.clock.increment()
-                        }
-                    })
+                    self.conn.send(make_answer(self.username, answer, self.clock.increment()))
                     print("[Client] Answer submitted!")
                     self.won_buzz = False
 
