@@ -30,6 +30,8 @@ round_active = False
 current_winner = None
 buzz_lock = threading.Lock()
 
+buzz_collection = []
+
 current_answer = None
 answer_event = threading.Event()
 
@@ -130,21 +132,12 @@ def handle_client_message(conn, msg):
         client_time = payload.get("lamport_time", 0)
         
         clock.update(client_time)
-        won = False
         
         with buzz_lock:
             if round_active:
-                round_active = False
-                current_winner = player_id
-                won = True
-
-        if won:
-            print(f"[SERVER] {player_id} buzzed in first!")
-            conn.send(make_winner(you_won=True, lamport_time=clock.increment()))
-            clients.broadcast(
-                make_winner(you_won=False, lamport_time=clock.increment(), winner_name=player_id), 
-                exclude=conn
-            )
+                arrival_time = time.time() 
+                buzz_collection.append((client_time, arrival_time, player_id, conn))
+                print(f"[SERVER] Received buzz from {player_id} (Lamport: {client_time})")
 
     elif msg_type == MsgType.ANSWER:
         player_id = msg.get("payload", {}).get("player_id")
@@ -194,30 +187,51 @@ def game_loop():
         print(f"\n[SERVER] Sending Question {question_number}...")
         clock.increment()
         
-        # REFACTORED: Use messages factory
         clients.broadcast(make_question(question_number, q["question"], clock.get_time()))
 
         round_active = True
         current_winner = None
+        buzz_collection.clear() 
         
         timeout = 10
         start = time.time()
-        
-        while time.time() - start < timeout:
-            if not round_active: 
-                break 
-            time.sleep(0.1)
 
-        if round_active:
+        first_buzz_physical_time = None
+        
+        # 1. THE WAITING PHASE
+        while time.time() - start < timeout:
+            with buzz_lock:
+                if len(buzz_collection) > 0:
+                    if first_buzz_physical_time is None:
+                        first_buzz_physical_time = time.time()
+                    
+                    # The "Lamport Window": Wait 250ms for slower network packets
+                    if time.time() - first_buzz_physical_time >= 0.25:
+                        round_active = False
+                        break
+            time.sleep(0.05)
+
+        # 2. THE RESOLUTION PHASE
+        if len(buzz_collection) > 0:
             round_active = False
-            # REFACTORED: Use messages factory
-            clients.broadcast(make_result("Time's up! No one buzzed in.", clock.increment()))
-            print("[SERVER] No buzz received.")
-            time.sleep(3)
             
-        else:
+            # Sort by Lamport time first (x[0]). 
+            # If tied, sort by physical arrival time (x[1]) instead of alphabetically!
+            buzz_collection.sort(key=lambda x: (x[0], x[1]))
+            
+            winning_time, winning_arrival, current_winner, winning_conn = buzz_collection[0]
+
+            print(f"[SERVER] {current_winner} won the race! (Lamport: {winning_time})")
+            
+            # Send WINNER messages
+            winning_conn.send(make_winner(you_won=True, lamport_time=clock.increment()))
+            clients.broadcast(
+                make_winner(you_won=False, lamport_time=clock.increment(), winner_name=current_winner), 
+                exclude=winning_conn
+            )
+
+            # Wait for their answer
             print(f"[SERVER] Waiting up to 10 seconds for {current_winner} to answer...")
-            
             answer_event.clear()
             current_answer = None
             got_answer = answer_event.wait(timeout=10.0)
@@ -228,8 +242,14 @@ def game_loop():
                 result_msg = f"{current_winner} ran out of time to answer!"
                 print(f"[SERVER] {current_winner} timed out.")
 
-            # REFACTORED: Use messages factory
             clients.broadcast(make_result(result_msg, clock.increment()))
+            time.sleep(3)
+            
+        else:
+            # Time ran out, nobody buzzed
+            round_active = False
+            clients.broadcast(make_result("Time's up! No one buzzed in.", clock.increment()))
+            print("[SERVER] No buzz received.")
             time.sleep(3)
 
         question_number += 1
