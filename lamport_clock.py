@@ -1,20 +1,20 @@
+import threading
+
 class LamportClock:
     def __init__(self):
-        self.clock = 0
+        self.time = 0
+        self.lock = threading.Lock()
 
     def increment(self):
-        self.clock += 1
-        return self.clock
+        with self.lock:
+            self.time += 1
+            return self.time
 
-    def update(self, received_timestamp):
-        if not isinstance(received_timestamp, int):
-            raise ValueError("Timestamp must be an integer.")
-
-        self.clock = max(self.clock, received_timestamp) + 1
-        return self.clock
+    def update(self, received_time):
+        with self.lock:
+            self.time = max(self.time, received_time) + 1
+            return self.time
 
     def get_time(self):
-        return self.clock
-
-    def reset(self):
-        self.clock = 0
+        with self.lock:
+            return self.time

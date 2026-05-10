@@ -36,22 +36,30 @@ def recv_json(sock):
     return json.loads(line)
 
 def wait_for_keypress():
-    '''Block until the player presses any key.'''
-    import tty 
-    import termios
-    fd = sys.stdin.fileno()
-    old_settings = termios.tcgetattr(fd)
-    try:
-        tty.setraw(fd)
-        sys.stdin.read(1)
-    finally: 
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+    '''Block until the player presses any key (Cross-Platform).'''
+    if os.name == 'nt':  # Windows
+        import msvcrt
+        msvcrt.getch()
+    else:                # Linux/Mac
+        import sys
+        import tty 
+        import termios
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            sys.stdin.read(1)
+        finally: 
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 
 class PlayerClient:
     def __init__(self, username: str):
         self.username = username
         self.clock = LamportClock()
+
+        self.server_host = None
+        self.server_port = None
 
         self.current_question = None
         self.current_question_number = None
@@ -60,33 +68,26 @@ class PlayerClient:
         self.buzzed_this_round = False
 
         print(f"[Client] Starting as player: {username}")
-              
-    def register(self):
-        """Register this player with naming_server.py."""
-        try: 
+
+    def resolve_server(self):
+
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
             sock.connect((NAMING_HOST, NAMING_PORT))
 
-            self.clock.increment()
-
             send_json(sock, {
-                "type": "register",
-                "service": self.username,
-                "host": SERVER_HOST,
-                "port": SERVER_PORT,
-                "timestamp": self.clock.get_time()
+                "type": "resolve",
+                "service": "trivia.server.main"
             })
 
             response = recv_json(sock)
+
             sock.close()
 
-            if response and response.get("status") == "ok":
-                print(f"[Client] Registered with naming server as '{self.username}'")
-            else: 
-                print(f"[Client] Registration failed: {response}")
+            if response["status"] != "ok":
+                raise Exception("Could not resolve server")
 
-        except Exception as e: 
-            print(f"[Client] Could not connect to naming server: {e}")
+            return response["host"], response["port"]
     
     def listen_for_questions(self): 
         """Runs in background thread. Joins the UDP multicast group and listens for questions from the host"""
@@ -114,7 +115,10 @@ class PlayerClient:
                     q_num = msg.get("question_number")
 
                     received_ts = payload.get("timestamp", 0)
-                    self.clock.update(received_ts) if received_ts else self.clock.increment()
+                    if received_ts is not None:
+                        self.clock.update(received_ts)
+                    else:
+                        self.clock.increment()
 
                     with self.question_lock: 
                         self.current_question = question
@@ -136,11 +140,11 @@ class PlayerClient:
                     else:
                         print(f"\n[Client]'{winner}' buzzed in first (Lamport:{ts}). Better luck next time!")
 
-                elif msg_type == "START":
+                elif msg_type == "END":
                     print(f"\n[Client] Game over! Thanks for playing.")
                     sys.exit(0)
             except Exception as e:
-                print(f"[Client] Multicast error: {e}")
+                print("[Multicast Error]", e)
     
     def buzz_in(self):
         """Opens a TCP connection to the server and sends a BUZZ message"""
@@ -149,7 +153,7 @@ class PlayerClient:
             question = self.current_question
             q_num = self.current_question_number
         
-        if not question or not q_num: 
+        if question is None or q_num is None: 
             print("[Client] No active question to buzz in for.")
             return
         
@@ -160,7 +164,7 @@ class PlayerClient:
 
         try: 
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.connect((SERVER_HOST, SERVER_PORT))
+            sock.connect((self.server_host, self.server_port))
 
             send_json(sock, {
                 "type": "BUZZ",
@@ -182,7 +186,7 @@ class PlayerClient:
             payload = response.get("payload", {})
 
             resp_ts = payload.get("lamport_time", 0)
-            if resp_ts:
+            if resp_ts is not None:
                 self.clock.update(resp_ts)
 
             if resp_type == "WINNER": 
@@ -190,7 +194,7 @@ class PlayerClient:
 
                 if you_won: 
                     print(f"You buzzed in first! It's your turn to answer.")
-                    print(f"Question: {question}")
+                    print(f"Question: {self.current_question}")
                     answer = input("Your answer: ").strip()
 
                     send_json(sock, {
@@ -218,10 +222,34 @@ class PlayerClient:
         finally: 
             sock.close()
 
+    def register(self):
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.connect((NAMING_HOST, NAMING_PORT))
+
+            send_json(sock, {
+                "type": "register",
+                "service": self.username,
+                "host": "127.0.0.1",
+                "port": 9999
+            })
+
+            response = recv_json(sock)
+            sock.close()
+
+            if response and response.get("status") == "ok":
+                print(f"[Client] Registered as {self.username}")
+            else:
+                print(f"[Client] Registration failed: {response}")
+
+        except Exception as e:
+            print(f"[Client] Naming server error: {e}")
+
     def run(self):
         """Main entry point"""
 
         self.register()
+        self.server_host, self.server_port = self.resolve_server()
 
         mc_thread = threading.Thread(target=self.listen_for_questions, daemon=True)
         mc_thread.start()
@@ -242,8 +270,7 @@ class PlayerClient:
                     print(f"[Client] You already buzzed in this round!")
                     continue
 
-                buzz_thread = threading.Thread(target=self.buzz_in, daemon=True)
-                buzz_thread.start()
+                self.buzz_in()
             
             except KeyboardInterrupt:
                 print("\n[Client] Exiting.")
