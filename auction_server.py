@@ -22,6 +22,15 @@ auction_active = True
 # Lamport Clock Instance
 clock = LamportClock()
 
+# =========================
+# Naming Server Config
+# =========================
+
+NAMING_SERVER_HOST = "127.0.0.1"
+NAMING_SERVER_PORT = 4000
+
+SERVICE_NAME = "auction.server.main"
+
 
 # =========================
 # Socket Helpers
@@ -221,6 +230,45 @@ def auction_timer():
 
 
 # =========================
+# Register With Naming Server
+# =========================
+
+def register_with_naming_server():
+
+    try:
+
+        naming_socket = socket.socket(
+            socket.AF_INET,
+            socket.SOCK_STREAM
+        )
+
+        naming_socket.connect(
+            (NAMING_SERVER_HOST, NAMING_SERVER_PORT)
+        )
+
+        registration_message = {
+            "type": "register",
+            "service": SERVICE_NAME,
+            "host": "127.0.0.1",
+            "port": PORT
+        }
+
+        message = json.dumps(registration_message) + "\n"
+
+        naming_socket.sendall(message.encode())
+
+        response = naming_socket.recv(1024).decode()
+
+        print(f"[NAMING SERVER RESPONSE] {response.strip()}")
+
+        naming_socket.close()
+
+    except Exception as e:
+
+        print(f"[NAMING SERVER ERROR] {e}")
+
+
+# =========================
 # Main Server
 # =========================
 
@@ -230,21 +278,21 @@ def main():
 
     server.bind((HOST, PORT))
     server.listen()
+    server.settimeout(1)
 
     print(f"[SERVER STARTED] Listening on {HOST}:{PORT}")
 
+    register_with_naming_server()
+
     # Start Auction Countdown
     timer_thread = threading.Thread(
-        target=auction_timer,
-        daemon=True
+        target=auction_timer
     )
 
     timer_thread.start()
 
     while auction_active:
-
         try:
-
             client_socket, address = server.accept()
 
             with clients_lock:
@@ -252,16 +300,17 @@ def main():
 
             client_thread = threading.Thread(
                 target=handle_client,
-                args=(client_socket, address),
-                daemon=True
+                args=(client_socket, address)
             )
 
             client_thread.start()
 
         except KeyboardInterrupt:
-
             print("\n[SERVER SHUTDOWN]")
             break
+        
+        except socket.timeout:
+            continue
 
     server.close()
 
